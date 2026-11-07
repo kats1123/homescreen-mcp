@@ -4,7 +4,7 @@ version = "1.1.0"
 description = "Arrange your iPhone Home Screen from your Mac: drag-and-drop app, CLI and MCP server. Keeps App Library apps in the App Library."
 readme = "README.md"
 license = "MIT"
-license-files = ["LICENSE"]
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]
 authors = [{ name = "Jonathan Kats" }]
 requires-python = ">=3.11"
 keywords = ["iphone", "ios", "home screen", "springboard", "mcp", "app library", "screen time"]
@@ -16,7 +16,7 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Topic :: Utilities",
 ]
-dependencies = ["pymobiledevice3>=11", "mcp>=2,<3", "pillow", "starlette>=0.40", "uvicorn>=0.30"]
+dependencies = ["pymobiledevice3>=11.50.0,<12", "mcp>=2,<3", "pillow", "starlette>=0.40", "uvicorn>=0.30"]
 
 [project.optional-dependencies]
 dev = ["pytest", "httpx"]

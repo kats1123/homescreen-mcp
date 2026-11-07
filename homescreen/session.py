@@ -9,6 +9,9 @@ Rules:
 from __future__ import annotations
 
 import copy
+import fcntl
+import functools
+import os
 import datetime as dt
 import json
 import uuid
@@ -131,10 +134,30 @@ def _safe(s: str) -> str:
     return "".join(c if c.isalnum() or c in "-._" else "_" for c in s)
 
 
+def _device_operation(fn):
+    @functools.wraps(fn)
+    async def run(self, *args, **kwargs):
+        # Share one advisory lock across app, CLI and MCP processes using this data
+        # directory. In particular, a concurrent read must not clear a live marker.
+        with (self.dir / "device-operation.lock").open("a") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise LayoutError("A device operation is in progress; the session is busy. Try again when it finishes.")
+            self.busy = True
+            try:
+                return await fn(self, *args, **kwargs)
+            finally:
+                self.busy = False
+                fcntl.flock(lock, fcntl.LOCK_UN)
+    return run
+
+
 class Session:
     def __init__(self, source: Source, data_dir: str | Path, device: str | None = None):
         """device: keep this session's draft per device (the app switches between devices);
         None keeps the single shared draft the CLI and MCP server use."""
+        self.busy = False
         self.source = source
         self.dir = Path(data_dir)
         self.dir.mkdir(parents=True, exist_ok=True)
@@ -147,6 +170,9 @@ class Session:
         self._undo: list[tuple[Any, ...]] = []
         self._redo: list[tuple[Any, ...]] = []
         self._load_draft()
+        # A persisted CLI/MCP draft pins Auto reconnection too.
+        if hasattr(self.source, "udid") and not self.source.udid and self.device_id not in (None, "unselected"):
+            self.source.udid = self.device_id
 
     # ---- persistence ------------------------------------------------------------
 
@@ -352,10 +378,16 @@ class Session:
     def gaps_readable(self) -> bool:
         return getattr(self.source, "pins", None) is not None
 
+    @_device_operation
     async def read(self) -> dict[str, Any]:
         info = await self.source.info()
-        self.device_id = info.get("UniqueDeviceID") or self.source.name
-        self.info = {k: v for k, v in info.items() if k in ("DeviceName", "ProductType", "ProductVersion")}
+        actual = info.get("UniqueDeviceID")
+        if not actual:
+            raise LayoutError("Cannot verify device identity; no layout was read.")
+        if self._draft_key not in (None, "unselected", actual):
+            raise LayoutError("The selected draft belongs to a different device; no layout was read.")
+        self.device_id = actual
+        self.info = {k: v for k, v in info.items() if k in ("DeviceName", "ProductType", "ProductVersion") and v is not None}
         self.grid = Grid.from_metrics(info.get("icon_metrics"))
         state, library = await self._read_source()
         reads = self._dev_dir("reads")
@@ -366,6 +398,7 @@ class Session:
         self._undo.clear()
         self._redo.clear()
         self._save_draft()
+        self._pending_path.unlink(missing_ok=True)
         return {"device": {k: v for k, v in info.items() if k != "UniqueDeviceID"},
                 **self.layout.summary()["counts"]}
 
@@ -399,42 +432,60 @@ class Session:
 
     def _backup(self, state: list[Any], library: list[Any] | None, label: str,
                 pins: list[dict[str, int]] | None = None) -> Path:
-        p = self._dev_dir("backups") / f"{_stamp()}-{label}.plist"
-        p.write_bytes(_pack(state, library, pins))
+        p = self._dev_dir("backups") / f"{_stamp()}-{uuid.uuid4().hex[:8]}-{label}.plist"
+        blob = plistlib.loads(_pack(state, library, pins))
+        blob["device"] = self.device_id
+        with p.open("xb") as backup:
+            backup.write(plistlib.dumps(blob, fmt=plistlib.FMT_BINARY))
+            backup.flush()
+            os.fsync(backup.fileno())
         return p
 
     async def _write_verified(self, target: list[Any], target_lib: list[Any] | None,
                               label: str, pins: list[dict[str, int]] | None = None) -> dict[str, Any]:
+        self._require_resolved_write()
+        await self._verify_identity()
         current, current_lib = await self._read_source()
         backup = self._backup(current, current_lib, label,
                               pins_by_page(self._layout_from(current, current_lib)))
         target = self._restore_widget_ids(target)
         if target_lib is not None:
             target_lib = self._with_webclips(target, target_lib)
-        # A backup made before the App Library was tracked has no library list; judge the
-        # result on dock and pages only (the source keeps unlisted apps in the library).
         lib_known = target_lib is not None
+        # Persist BEFORE dispatch, so cancellation/process death also requires a read.
+        # Exclusive creation prevents a second process from dispatching while pending.
+        try:
+            with self._pending_path.open("x") as marker:
+                json.dump({"backup": backup.name, "device": self.device_id}, marker)
+                marker.flush()
+                os.fsync(marker.fileno())
+        except FileExistsError:
+            raise LayoutError("A write is pending or unverified. Read the device before another write.")
+        write_error = None
         try:
             await self.source.write(target, target_lib, pins)
         except Exception as e:
-            # A lost response doesn't tell us whether the write landed. Look, don't retry.
+            write_error = str(e)
+        # A lost response cannot tell us whether the write landed. Read once on a
+        # fresh connection to the same phone; NEVER resend or automatically restore.
+        try:
+            await self._verify_identity()
             after, after_lib = await self._read_source()
-            want_pins = {k: v for page in pins or [] for k, v in page.items()}
-            got_pins = getattr(self.source, "pins", None)
-            landed = (placed_structure(after, after_lib if lib_known else None,
-                                       want_pins if got_pins is None else got_pins, self.grid)
-                      == placed_structure(target, target_lib, want_pins, self.grid))
-            return {"ok": landed, "backup": backup.name,
-                    "error": f"write call failed ({e}); re-read shows the new layout "
-                             f"{'DID' if landed else 'did NOT'} land. Not retrying."}
-        after, after_lib = await self._read_source()
+        except Exception as e:
+            return {"ok": False, "outcome": "unknown", "backup": backup.name, "needs_read": True,
+                    "error": f"Write outcome is unknown; verification failed ({e}). "
+                             "Reconnect, then Read device and inspect it before applying or restoring. "
+                             "Nothing was retried.", "write_error": write_error}
         want_pins = {k: v for page in pins or [] for k, v in page.items()}
         # the phone can't report gaps; there the written gaps are taken as given and the order checked
         got_pins = getattr(self.source, "pins", None)
         got_pins = want_pins if got_pins is None else got_pins
         ok = (placed_structure(after, after_lib if lib_known else None, got_pins, self.grid)
               == placed_structure(target, target_lib, want_pins, self.grid))
-        res: dict[str, Any] = {"ok": ok, "backup": backup.name}
+        res: dict[str, Any] = {"ok": ok, "backup": backup.name,
+                               "outcome": "verified" if ok else "mismatch", "needs_read": False}
+        if write_error:
+            res["error"] = f"Write call failed ({write_error}); re-read shows the new layout {'DID land' if ok else 'did NOT land'}. Nothing was retried."
         if after_lib is not None:
             res["app_library_only"] = len(after_lib)
         if not ok:
@@ -464,9 +515,32 @@ class Session:
         self._undo.clear()
         self._redo.clear()
         self._save_draft()
+        self._pending_path.unlink(missing_ok=True)
         return res
 
+    @property
+    def _pending_path(self) -> Path:
+        return self._dev_dir("pending-writes") / "write.json"
+
+    @property
+    def needs_read(self) -> bool:
+        return self._pending_path.exists()
+
+    def _require_resolved_write(self) -> None:
+        if self.needs_read:
+            raise LayoutError("A previous write is pending or unverified. Read the device before another write.")
+
+    async def _verify_identity(self) -> None:
+        actual = (await self.source.info()).get("UniqueDeviceID")
+        if not actual or not self.device_id or self.device_id == "unselected":
+            raise LayoutError("Cannot verify device identity. Read the intended device first; nothing was written.")
+        if actual != self.device_id:
+            raise LayoutError("This layout or backup belongs to a different device; nothing was written.")
+
+    @_device_operation
     async def apply(self, token: str) -> dict[str, Any]:
+        self._require_resolved_write()
+        await self._verify_identity()
         lay = self.require()
         if token != lay.token():
             raise LayoutError("token doesn't match the current draft; run diff and use its apply_token")
@@ -482,9 +556,13 @@ class Session:
     def backups(self) -> list[str]:
         return sorted(p.name for p in self._dev_dir("backups").glob("*.plist"))
 
+    @_device_operation
     async def restore(self, name: str) -> dict[str, Any]:
         p = self._dev_dir("backups") / name
         if not p.exists() or p.parent != self._dev_dir("backups"):
             raise LayoutError(f"no backup named {name!r}")
         data = p.read_bytes()
+        blob = plistlib.loads(data)
+        if isinstance(blob, dict) and blob.get("device") and blob["device"] != self.device_id:
+            raise LayoutError("This backup belongs to a different device; nothing was written.")
         return await self._write_verified(*_unpack(data), "before-restore", _unpack_pins(data))

@@ -7,13 +7,16 @@ from typing import Any, Callable
 
 from mcp.server.mcpserver import Image, MCPServer
 
-from . import organize, preview, usage
+from . import organize, preview, usage, config
+from .transport import discover_devices
 from .config import DATA, session
 from .model import Layout, LayoutError
 
 ALLOW_APPLY = os.environ.get("HOMESCREEN_ALLOW_APPLY") == "1"
 
-INSTRUCTIONS = """Arrange an iPhone Home Screen. Workflow: read_phone -> show_layout -> edit the
+INSTRUCTIONS = """Arrange an iPhone/iPad Home Screen over USB or paired Wi-Fi. Use list_devices and
+connect_device to select transport and UDID; pair_wifi needs explicit user approval.
+Workflow: read_phone -> show_layout -> edit the
 draft (arrange / move / create_folder / sort_* / file_into_folders ...) -> diff -> render_preview
 -> apply only when the user explicitly asks. Every edit is one undo step (undo / redo).
 Item ids: apps use their bundle id; folders and widgets use folder:N / widget:N.
@@ -42,6 +45,34 @@ def _edit(fn: Callable[[Layout], Any]) -> dict[str, Any]:
     elif out is not None:
         res["result"] = out
     return res
+
+
+@mcp.tool()
+async def list_devices() -> list[dict[str, Any]]:
+    """Discover trusted USB and previously paired Wi-Fi devices and their methods."""
+    return await discover_devices()
+
+
+@mcp.tool()
+async def connect_device(transport: str = "usb", udid: str | None = None) -> dict[str, Any]:
+    """Select USB, Wi-Fi or Auto and connect. Select a UDID when several devices exist.
+    Does not read, replace or apply a draft. Auto never switches physical devices."""
+    config.configure_connection(transport, udid)
+    return await config.reconnect()
+
+
+@mcp.tool()
+async def reconnect_device() -> dict[str, Any]:
+    """Rediscover the same device. After an interrupted write, call read_phone to inspect;
+    reconnect never writes or clears the pending-write guard."""
+    return await config.reconnect()
+
+
+@mcp.tool()
+async def pair_wifi() -> dict[str, Any]:
+    """Enable wireless connections and save a RemotePairing record over trusted USB.
+    Only call when the user explicitly requests Wi-Fi pairing. Does not change the layout."""
+    return await config.pair_wifi()
 
 
 @mcp.tool()

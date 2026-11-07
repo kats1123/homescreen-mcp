@@ -10,6 +10,8 @@ import sys
 
 from .model import LayoutError
 from .config import DATA, session
+from . import config
+from .transport import ConnectionError, MODES
 
 
 def _print(obj) -> None:
@@ -21,8 +23,18 @@ def _confirm(msg: str) -> bool:
 
 
 async def run(args: argparse.Namespace) -> int:
+    if args.cmd == "devices":
+        from .transport import discover_devices
+        _print(await discover_devices())
+        return 0
     s = session()
-    if args.cmd == "read":
+    if args.cmd in ("connect", "reconnect"):
+        _print(await config.reconnect())
+    elif args.cmd == "pair-wifi":
+        if not _confirm("This enables wireless connections and saves pairing credentials using trusted USB."):
+            return 1
+        _print(await config.pair_wifi())
+    elif args.cmd == "read":
         _print(await s.read())
     elif args.cmd == "show":
         _print(s.require().summary())
@@ -69,8 +81,14 @@ async def run(args: argparse.Namespace) -> int:
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(prog="homescreen", description="iPhone Home Screen layouts over USB")
+    p = argparse.ArgumentParser(prog="homescreen", description="iPhone and iPad Home Screen layouts over USB or Wi-Fi")
+    p.add_argument("--transport", choices=MODES, help="USB (default), Wi-Fi, or USB-first Auto")
+    p.add_argument("--udid", help="select the physical device (never changes automatically)")
     sub = p.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("devices", help="discover USB and paired Wi-Fi devices")
+    sub.add_parser("pair-wifi", help="enable Wi-Fi and pair once over trusted USB (asks first)")
+    sub.add_parser("connect", help="check the selected connection without changing the draft")
+    sub.add_parser("reconnect", help="rediscover the same device without writing or replacing the draft")
     sub.add_parser("read", help="read the phone and start a fresh draft")
     sub.add_parser("show", help="print the draft")
     sub.add_parser("diff", help="what applying would change, plus the apply token")
@@ -85,13 +103,19 @@ def main() -> None:
     u.add_argument("--port", type=int, default=8765)
     u.add_argument("--no-browser", action="store_true")
     args = p.parse_args()
+    if args.transport:
+        import os
+        os.environ["HOMESCREEN_TRANSPORT"] = args.transport
+    if args.udid:
+        import os
+        os.environ["HOMESCREEN_UDID"] = args.udid
     if args.cmd == "ui":
         from . import ui
         ui.main(args.port, not args.no_browser)
         return
     try:
         sys.exit(asyncio.run(run(args)))
-    except LayoutError as e:
+    except (LayoutError, ConnectionError, ValueError, OSError) as e:
         print(f"error: {e}", file=sys.stderr)
         sys.exit(2)
 

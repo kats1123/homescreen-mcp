@@ -32,6 +32,7 @@ rm -rf $APP
 mkdir -p $APP/Contents/MacOS $APP/Contents/Resources
 cp $SHELL_BIN $APP/Contents/MacOS/Homescreen
 cp -R $BUILD/dist/engine $APP/Contents/Resources/engine
+cp $ROOT/LICENSE $ROOT/THIRD_PARTY_NOTICES.md $APP/Contents/Resources/
 $VENV/bin/python $ROOT/macapp/make_icon.py $BUILD/AppIcon.iconset
 iconutil -c icns $BUILD/AppIcon.iconset -o $APP/Contents/Resources/AppIcon.icns
 cat > $APP/Contents/Info.plist <<PLIST
@@ -49,6 +50,8 @@ cat > $APP/Contents/Info.plist <<PLIST
   <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>LSApplicationCategoryType</key><string>public.app-category.utilities</string>
   <key>NSHighResolutionCapable</key><true/>
+  <key>NSLocalNetworkUsageDescription</key><string>Homescreen discovers and connects to your paired iPhone or iPad to read and apply Home Screen layouts over Wi-Fi.</string>
+  <key>NSBonjourServices</key><array><string>_remotepairing._tcp</string></array>
   <key>NSHumanReadableCopyright</key><string>MIT License. Not affiliated with Apple.</string>
   <key>NSAppTransportSecurity</key><dict><key>NSAllowsLocalNetworking</key><true/></dict>
 </dict></plist>

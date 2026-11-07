@@ -237,3 +237,10 @@ main { flex: 1; display: flex; min-height: 0; }
   .page { width: 100%; }
   .grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
 }
+
+.connection-bar { gap: 10px; flex-wrap: wrap; padding-block: 7px; font-size: 12px; }
+.connection-bar label, #connection-status { color: var(--muted); }
+.connection-bar select { font: inherit; color: var(--fg); background: var(--panel-2);
+  border: 1px solid var(--line); border-radius: 7px; padding: 5px 8px; }
+#connection-status { flex: 1; min-width: 180px; overflow-wrap: anywhere; }
+#connection-status.problem { color: var(--danger); }

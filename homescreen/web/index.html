@@ -41,12 +41,24 @@
   <button id="help" title="How it works" aria-label="Help">?</button>
   <button id="read" class="primary">Read device</button>
 </header>
+<section class="bar connection-bar" aria-label="Device connection">
+  <label for="transport">Connection</label>
+  <select id="transport" aria-label="Connection mode">
+    <option value="usb">USB</option>
+    <option value="wifi">Wi-Fi</option>
+    <option value="auto">Auto (USB first)</option>
+  </select>
+  <span id="connection-status" role="status" aria-live="polite">Not connected</span>
+  <div class="spacer"></div>
+  <button id="pair-wifi">Pair for Wi-Fi…</button>
+  <button id="reconnect">Reconnect</button>
+</section>
 
 <main id="main">
   <section id="empty" class="empty" hidden>
     <div class="empty-card">
       <h1>Arrange your Home Screen</h1>
-      <p>Connect your iPhone or iPad with a cable, unlock it and tap <b>Trust</b> if asked. Then read its Home Screen. Nothing changes on the device until you choose Apply.</p>
+      <p>Connect your iPhone or iPad with USB and trust this Mac. For wireless access, choose <b>Pair for Wi-Fi</b> once over USB, then select <b>Wi-Fi</b> or <b>Auto</b> on the same network. Unlock the device and read its Home Screen. Nothing changes on the device until you choose Apply.</p>
       <button class="primary big" id="read-empty">Read device</button>
     </div>
   </section>

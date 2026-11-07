@@ -79,12 +79,14 @@ def _usage_view(lay: Layout) -> dict[str, Any] | None:
 def view() -> dict[str, Any]:
     s = session()
     if s.layout is None:
-        return {"loaded": False, "source": s.source.name, "device_id": config.current_device()}
+        return {"loaded": False, "source": s.source.name, "device_id": config.current_device(),
+                "connection": config.connection_status()}
     lay = s.layout
     d = lay.diff()
     moved = {k.rsplit("[", 1)[-1].rstrip("]") for k in d["moves"]}
     return {
         "loaded": True,
+        "connection": config.connection_status(),
         "source": s.source.name,
         "device_id": s.device_id,
         "device": s.info,
@@ -241,29 +243,12 @@ async def post_apply(request: Request) -> Response:
     return JSONResponse({"result": result, "view": view()})
 
 
-_names: dict[str, dict[str, Any]] = {}  # udid -> name/model/version, looked up once per launch
-
-
 async def _connected() -> dict[str, dict[str, Any]]:
-    from pymobiledevice3 import usbmux
-    from pymobiledevice3.lockdown import create_using_usbmux
-    out: dict[str, dict[str, Any]] = {}
-    try:
-        devs = await usbmux.list_devices()
-    except Exception:
-        return out
-    for d in sorted(devs, key=lambda d: d.connection_type != "USB"):  # USB first
-        if d.serial in out:
-            continue
-        if d.serial not in _names:
-            try:
-                v = (await create_using_usbmux(serial=d.serial)).all_values
-                _names[d.serial] = {"name": v.get("DeviceName"), "model": v.get("ProductType"),
-                                    "version": v.get("ProductVersion"), "class": v.get("DeviceClass")}
-            except Exception:
-                continue  # locked and never trusted, or gone already
-        out[d.serial] = {**_names[d.serial], "connection": "USB" if d.connection_type == "USB" else "Wi-Fi"}
-    return out
+    from .transport import discover_devices
+    return {d["udid"]: {**{k: d[k] for k in ("name", "model", "version") if d.get(k)},
+                         "methods": d["methods"],
+                         "connection": " / ".join("Wi-Fi" if m == "wifi" else "USB" for m in d["methods"])}
+            for d in await discover_devices()}
 
 
 async def get_devices(request: Request) -> Response:
@@ -271,7 +256,10 @@ async def get_devices(request: Request) -> Response:
         return bad
     if not config.switching():
         return JSONResponse({"switching": False, "current": None, "devices": []})
-    connected = await _connected()
+    try:
+        connected = await _connected()
+    except Exception as e:
+        return _err(RuntimeError(f"Device discovery failed: {e}"), 502)
     known = config.known_devices()
     devices = [{"udid": u, **known.get(u, {}), **c, "connected": True, "draft": u in known} for u, c in connected.items()]
     devices += [{"udid": u, **k, "connected": False, "draft": True} for u, k in known.items() if u not in connected]
@@ -285,8 +273,45 @@ async def post_device(request: Request) -> Response:
     if not udid:
         return _err(LayoutError("no device given"))
     async with _device_lock:
-        config.select_device(udid)
+        try:
+            config.select_device(udid)
+        except ValueError as e:
+            return _err(e)
     return JSONResponse(view())
+
+
+async def post_connection(request: Request) -> Response:
+    if (bad := _guard(request)):
+        return bad
+    body = await _json(request)
+    async with _device_lock:
+        try:
+            config.configure_connection(str(body.get("mode", "usb")))
+        except ValueError as e:
+            return _err(e)
+    return JSONResponse(view())
+
+
+async def post_reconnect(request: Request) -> Response:
+    if (bad := _guard(request)):
+        return bad
+    async with _device_lock:
+        try:
+            await config.reconnect()
+        except Exception as e:
+            return _err(e, 502)
+    return JSONResponse(view())
+
+
+async def post_pair_wifi(request: Request) -> Response:
+    if (bad := _guard(request)):
+        return bad
+    async with _device_lock:
+        try:
+            result = await config.pair_wifi()
+        except Exception as e:
+            return _err(e, 502)
+    return JSONResponse({"result": result, "view": view()})
 
 
 async def get_backups(request: Request) -> Response:
@@ -332,6 +357,9 @@ app = Starlette(routes=[
     Route("/api/apply", post_apply, methods=["POST"]),
     Route("/api/devices", get_devices),
     Route("/api/device", post_device, methods=["POST"]),
+    Route("/api/connection", post_connection, methods=["POST"]),
+    Route("/api/reconnect", post_reconnect, methods=["POST"]),
+    Route("/api/pair-wifi", post_pair_wifi, methods=["POST"]),
     Route("/api/backups", get_backups),
     Route("/api/restore", post_restore, methods=["POST"]),
     Route("/icon", get_icon),

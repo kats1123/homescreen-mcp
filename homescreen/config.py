@@ -23,13 +23,13 @@ def booted_sim() -> str:
 
 
 def make_source() -> Source:
-    """HOMESCREEN_FIXTURE (a saved layout) > HOMESCREEN_SIM (booted|udid) > USB iPhone."""
+    """HOMESCREEN_FIXTURE (a saved layout) > HOMESCREEN_SIM (booted|udid) > selected iPhone/iPad transport."""
     fixture, sim = os.environ.get("HOMESCREEN_FIXTURE"), os.environ.get("HOMESCREEN_SIM")
     if fixture:
         return FileSource(fixture)
     if sim:
         return SimSource(booted_sim() if sim == "booted" else sim)
-    return PhoneSource(os.environ.get("HOMESCREEN_UDID"))
+    return PhoneSource(os.environ.get("HOMESCREEN_UDID"), transport=os.environ.get("HOMESCREEN_TRANSPORT", "usb"))
 
 
 _session: Session | None = None
@@ -37,13 +37,15 @@ _session: Session | None = None
 # The app (and `homescreen ui`) can switch between connected devices, each with its own draft.
 # The CLI and MCP server keep one session for the device the environment picks.
 _switching = False
+_mode = os.environ.get("HOMESCREEN_TRANSPORT", "usb")
 _sessions: dict[str, Session] = {}
 _current: str | None = None
 LAST_DEVICE = DATA / "last-device.txt"
 
 
 def enable_device_switching() -> None:
-    global _switching, _current
+    global _switching, _current, _mode
+    _mode = os.environ.get("HOMESCREEN_TRANSPORT", "usb")
     if os.environ.get("HOMESCREEN_FIXTURE") or os.environ.get("HOMESCREEN_SIM") or os.environ.get("HOMESCREEN_UDID"):
         return  # a pinned source: nothing to switch between
     _switching = True
@@ -78,6 +80,8 @@ def current_device() -> str | None:
 
 def select_device(udid: str) -> Session:
     global _current
+    if session().busy:
+        raise ValueError("A device operation is in progress; wait before switching devices")
     _current = udid
     DATA.mkdir(parents=True, exist_ok=True)
     LAST_DEVICE.write_text(udid)
@@ -105,8 +109,57 @@ def session() -> Session:
     if _switching:
         key = _current or ""
         if key not in _sessions:
-            _sessions[key] = Session(PhoneSource(_current), DATA, device=_current or "unselected")
+            _sessions[key] = Session(PhoneSource(_current, transport=_mode), DATA, device=_current or "unselected")
         return _sessions[key]
     if _session is None:
         _session = Session(make_source(), DATA)
     return _session
+
+
+def connection_status() -> dict:
+    s = session()
+    if isinstance(s.source, PhoneSource):
+        return {**s.source.connection.status(), "needs_read": s.needs_read}
+    return {"mode": "fixture" if isinstance(s.source, FileSource) else "simulator",
+            "state": "ready", "transport": None, "needs_read": s.needs_read}
+
+
+def configure_connection(mode: str, udid: str | None = None) -> Session:
+    """Select a transport/device without reading, discarding or applying a draft."""
+    global _session, _mode
+    from .transport import MODES
+    if mode not in MODES:
+        raise ValueError(f"connection must be one of {', '.join(MODES)}")
+    s = session()
+    if s.busy:
+        raise ValueError("A device operation is in progress; wait before changing connection")
+    if not isinstance(s.source, PhoneSource):
+        raise ValueError("Connection controls apply only to a physical iPhone or iPad")
+    if udid and udid != s.source.udid:
+        if _switching:
+            s = select_device(udid)
+        else:
+            _session = s = Session(PhoneSource(udid, transport=mode), DATA, device=udid)
+    _mode = mode
+    s.source.connection.mode = mode
+    s.source.connection.state = "disconnected"
+    s.source.connection.error = None
+    return s
+
+
+async def reconnect() -> dict:
+    """Probe the selected connection. Never reads/replaces a draft or clears recovery."""
+    s = session()
+    if not isinstance(s.source, PhoneSource):
+        raise ValueError("Reconnect applies only to a physical iPhone or iPad")
+    # Opening always rediscovers the same UDID and closes the operation's sockets.
+    async with s.source.connection.open():
+        pass
+    return connection_status()
+
+
+async def pair_wifi() -> dict:
+    s = session()
+    if not isinstance(s.source, PhoneSource):
+        raise ValueError("Wi-Fi pairing requires a trusted USB iPhone or iPad")
+    return await s.source.connection.pair_wifi()

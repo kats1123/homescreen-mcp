@@ -158,6 +158,7 @@ function setView(v) {
 }
 
 function render() {
+  renderConnection();
   const loaded = V && V.loaded;
   $("#empty").hidden = loaded;
   $("#board").hidden = !loaded;
@@ -415,7 +416,8 @@ function renderFooter() {
     if (d.gaps_changed) { add(" · "); add(`${d.gaps_changed}`, true); add(" gap change" + (d.gaps_changed > 1 ? "s" : "")); }
   }
   if (d.problems.length) s.appendChild(el("span", "problem", ` · ${d.problems.length} problem${d.problems.length > 1 ? "s" : ""}`));
-  btn.disabled = !d.items_moved && d.pages_before === d.pages_after && !d.gaps_changed;
+  btn.disabled = !!(V.connection && V.connection.needs_read) ||
+    (!d.items_moved && d.pages_before === d.pages_after && !d.gaps_changed);
 }
 
 // ---- interaction -----------------------------------------------------------------------
@@ -582,12 +584,13 @@ const deviceLabel = () => {
 };
 
 async function loadDevices() {
-  try { DEV = await api("/api/devices"); } catch (_) { return; }
+  try { DEV = await api("/api/devices"); } catch (e) { toast(e.message, "error"); return; }
   $("#device-btn").classList.toggle("static", !DEV.switching);
-  // nothing chosen yet: take the first connected device
-  if (DEV.switching && !DEV.devices.some((d) => d.udid === DEV.current)) {
-    const first = DEV.devices.find((d) => d.connected);
-    if (first) return selectDevice(first.udid, true);
+  // Only choose automatically on the first launch with exactly one device.
+  // A missing/disconnected selection must never switch to another physical device.
+  const connected = DEV.devices.filter((d) => d.connected);
+  if (DEV.switching && !DEV.current && connected.length === 1) {
+    return selectDevice(connected[0].udid, true);
   }
   renderDeviceMenu();
   if (!V || !V.loaded) render();
@@ -597,7 +600,7 @@ function renderDeviceMenu() {
   const m = $("#device-menu");
   m.replaceChildren();
   if (!DEV.devices.length) {
-    m.appendChild(el("div", "menu-note", "No devices. Connect an iPhone or iPad with a cable and unlock it."));
+    m.appendChild(el("div", "menu-note", "No devices found. Connect over USB, or unlock a previously paired device on the same Wi-Fi network."));
   }
   for (const d of DEV.devices) {
     const b = el("button", "device-row" + (d.udid === DEV.current ? " current" : ""));
@@ -628,6 +631,43 @@ async function selectDevice(udid, quiet) {
     render();
   } catch (e) { toast(e.message, "error"); }
 }
+
+function renderConnection() {
+  const c = (V && V.connection) || {};
+  const physical = ["usb", "wifi", "auto"].includes(c.mode);
+  $("#transport").disabled = !physical;
+  if (physical) $("#transport").value = c.mode;
+  $("#pair-wifi").disabled = !physical;
+  $("#reconnect").disabled = !physical;
+  const label = c.transport === "wifi" ? "Wi-Fi" : "USB";
+  const text = c.needs_read ? "Write unverified — reconnect, then Read device before continuing"
+    : c.error ? c.error
+    : !physical ? "Fixture / Simulator"
+    : c.state === "ready" ? `Last check: ${label} · ready`
+    : c.state === "connected" ? `Connected via ${label}`
+    : "Select a device and read or reconnect";
+  $("#connection-status").textContent = text;
+  $("#connection-status").classList.toggle("problem", !!(c.error || c.needs_read));
+}
+
+$("#transport").onchange = async (e) => {
+  try { setView(await api("/api/connection", { mode: e.target.value })); }
+  catch (error) { toast(error.message, "error"); renderConnection(); }
+};
+$("#reconnect").onclick = async () => {
+  try {
+    setView(await withBusy("Reconnecting to the selected device…", () => api("/api/reconnect", {})));
+    toast("Connection checked. Your draft is unchanged.", "ok");
+  } catch (e) { toast(e.message, "error"); }
+};
+$("#pair-wifi").onclick = async () => {
+  if (!(await confirmBox("Pair for Wi-Fi", "Connect the selected device with USB, unlock it and trust this Mac first. This enables wireless connections and saves pairing credentials on this Mac. Use a trusted network. Your Home Screen is unchanged.", "Pair device"))) return;
+  try {
+    const response = await withBusy("Pairing the selected device over USB…", () => api("/api/pair-wifi", {}));
+    setView(response.view);
+    toast(response.result.message, "ok");
+  } catch (e) { toast(e.message, "error"); }
+};
 
 // ---- top-level actions ----------------------------------------------------------------
 
@@ -667,7 +707,7 @@ async function review() {
   }
   body.appendChild(ul);
   if (V.gaps && !V.gaps.readable) {
-    body.appendChild(el("p", null, `Gaps: iOS doesn't report empty spaces or hidden pages over USB, so any gaps made on the ${D()} itself will close. `
+    body.appendChild(el("p", null, `Gaps: iOS doesn't report empty spaces or hidden pages over the device service, so any gaps made on the ${D()} itself will close. `
       + (V.gaps.count ? `The ${V.gaps.count} placed item${V.gaps.count > 1 ? "s" : ""} you set here keep their spots.` : "To keep a gap, place the app in that spot here.")));
   }
   body.appendChild(el("p", null, `Your current layout is backed up first. After writing, the app reads the ${D()} again to check the result.`));
@@ -694,7 +734,9 @@ function showResult(r) {
   pre.style.cssText = "white-space:pre-wrap;font-size:12px;max-height:40vh;overflow:auto";
   pre.textContent = JSON.stringify(r.mismatches || {}, null, 1);
   body.appendChild(pre);
-  body.appendChild(el("p", null, `Backup saved as ${r.backup}. You can restore it from Backups.`));
+  body.appendChild(el("p", null, `Backup saved as ${r.backup}. ` + (r.needs_read
+    ? "Reconnect and read the device first. Inspect the current layout before choosing another apply or a backup restore."
+    : "You can restore it from Backups.")));
   modal({ title: "Check the result", body, actions: [{ label: "OK", primary: true, value: () => null }] });
 }
 

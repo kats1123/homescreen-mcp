@@ -1,4 +1,4 @@
-"""Where layouts come from: a USB iPhone (pymobiledevice3), an iOS Simulator, or a fixture file.
+"""Where layouts come from: a USB or Wi-Fi iPhone/iPad (pymobiledevice3), an iOS Simulator, or a fixture file.
 
 Every source reads and writes (state, library):
 - state: [dock, page1, page2, ...] in SpringBoard's "formatVersion 2" shape (apps are dicts).
@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from .model import is_folder, is_widget
+from .transport import PhoneConnection, device_values
 
 Layout = tuple[list[Any], list[Any] | None]
 
@@ -183,7 +184,7 @@ NEVER_ON_HOME_SCREEN = {
 
 
 class PhoneSource:
-    """A USB-connected iPhone. Pairing goes through Apple's 'Trust This Computer' prompt.
+    """A trusted iPhone/iPad, over USB or a paired RemotePairing Wi-Fi tunnel.
 
     The App Library isn't readable over USB, so read() works it out: installed apps
     (offloaded ones included) that aren't in the layout, minus hidden and never-shown apps.
@@ -192,46 +193,50 @@ class PhoneSource:
     onto a page). HOMESCREEN_FORMAT picks the formatVersion for getIconState (default "2").
     """
 
-    def __init__(self, udid: str | None = None, format_version: str | None = None):
-        self.udid = udid
+    def __init__(self, udid: str | None = None, format_version: str | None = None,
+                 transport: str = "usb"):
+        self.connection = PhoneConnection(udid, transport)
         self.name = "phone"
         self.format_version = format_version or os.environ.get("HOMESCREEN_FORMAT", "2")
         self.write_mode = os.environ.get("HOMESCREEN_WRITE", "full")
-        self._lockdown = None
         self._last_dict: dict[str, Any] | None = None
 
-    async def _ld(self):
-        if self._lockdown is None:
-            from pymobiledevice3.lockdown import create_using_usbmux
-            self._lockdown = await create_using_usbmux(serial=self.udid)
-        return self._lockdown
+    @property
+    def udid(self) -> str | None:
+        return self.connection.udid
 
-    async def _call(self, fn):
-        """Run fn(springboard) on a fresh service connection; drop the lockdown on failure
-        so an unplugged/replugged phone reconnects next time."""
+    @udid.setter
+    def udid(self, value: str | None) -> None:
+        self.connection.udid = value
+
+    async def _call(self, fn, provider=None):
         from pymobiledevice3.services.springboard import SpringBoardServicesService
-        try:
-            async with SpringBoardServicesService(lockdown=await self._ld()) as sb:
-                return await fn(sb)
-        except Exception:
-            self._lockdown = None
-            raise
+        if provider is None:
+            async with self.connection.open() as provider:
+                return await self._call(fn, provider)
+        async with SpringBoardServicesService(lockdown=provider) as sb:
+            return await fn(sb)
 
     async def info(self) -> dict[str, Any]:
-        vals = (await self._ld()).all_values
-        out = {k: vals.get(k) for k in ("DeviceName", "ProductType", "ProductVersion", "UniqueDeviceID")}
-        try:
-            out["icon_metrics"] = await self._call(lambda sb: sb.get_homescreen_icon_metrics())
-        except Exception as e:  # metrics are a nice-to-have
-            out["icon_metrics_error"] = str(e)
-        return out
+        async with self.connection.open() as provider:
+            vals = device_values(provider)
+            out = {k: vals.get(k) for k in ("DeviceName", "ProductType", "ProductVersion", "UniqueDeviceID")}
+            try:
+                out["icon_metrics"] = await self._call(lambda sb: sb.get_homescreen_icon_metrics(), provider)
+            except Exception as e:  # metrics are a nice-to-have
+                out["icon_metrics_error"] = str(e)
+            out["connection"] = self.connection.transport
+            return out
 
     async def read_raw(self, format_version: str | None) -> Any:
         return await self._call(lambda sb: sb.get_icon_state(format_version=format_version))
 
-    async def installed_apps(self) -> dict[str, dict[str, Any]]:
+    async def installed_apps(self, provider=None) -> dict[str, dict[str, Any]]:
         from pymobiledevice3.services.installation_proxy import InstallationProxyService
-        async with InstallationProxyService(lockdown=await self._ld()) as ip:
+        if provider is None:
+            async with self.connection.open() as provider:
+                return await self.installed_apps(provider)
+        async with InstallationProxyService(lockdown=provider) as ip:
             return await ip.get_apps(application_type="Any", calculate_sizes=False, show_placeholders=True)
 
     async def memory_reports(self, out: Path) -> list[Path]:
@@ -239,39 +244,42 @@ class PhoneSource:
         apps held in memory) into out. Read-only: nothing is erased on the device."""
         from pymobiledevice3.services.crash_reports import CrashReportsManager
         out.mkdir(parents=True, exist_ok=True)
-        async with CrashReportsManager(await self._ld()) as cr:
-            await cr.pull(str(out), match=r"JetsamEvent", progress_bar=False)
+        async with self.connection.open() as provider:
+            async with CrashReportsManager(provider) as cr:
+                await cr.pull(str(out), match=r"JetsamEvent", progress_bar=False)
         return sorted(out.rglob("JetsamEvent*.ips"))
 
     async def read(self) -> Layout:
-        raw = await self.read_raw(self.format_version)
-        if is_dict_format(raw):
-            self._last_dict = raw
-            return disk_to_model(raw)
-        self._last_dict = None
-        if self.write_mode == "list":
-            return raw, None
-        return raw, library_from_installed(raw, await self.installed_apps())
+        async with self.connection.open() as provider:
+            raw = await self._call(lambda sb: sb.get_icon_state(format_version=self.format_version), provider)
+            if is_dict_format(raw):
+                self._last_dict = raw
+                return disk_to_model(raw)
+            self._last_dict = None
+            if self.write_mode == "list":
+                return raw, None
+            return raw, library_from_installed(raw, await self.installed_apps(provider))
 
     pins: dict[str, int] | None = None  # the phone never reports gaps
 
     async def write(self, state: list[Any], library: list[Any] | None,
                     pins: list[dict[str, int]] | None = None) -> None:
-        if self._last_dict is not None:
-            payload: Any = model_to_disk(state, library, self._last_dict, pins)
-        elif self.write_mode == "list":
-            if library:
-                raise ValueError("HOMESCREEN_WRITE=list can't keep apps in the App Library")
-            payload = state
-        else:
-            # Safety net: any installed app in neither the layout nor the library (an old
-            # backup, an app installed meanwhile) goes to the library, never onto a page.
-            library = list(library or [])
-            listed = {_leaf_id(x) for x in library if isinstance(x, dict)}
-            library += [x for x in library_from_installed(state, await self.installed_apps())
-                        if x["bundleIdentifier"] not in listed]
-            payload = to_root_archive(state, library, pins)
-        await self._call(lambda sb: sb.set_icon_state(payload))
+        async with self.connection.open() as provider:
+            if self._last_dict is not None:
+                payload: Any = model_to_disk(state, library, self._last_dict, pins)
+            elif self.write_mode == "list":
+                if library:
+                    raise ValueError("HOMESCREEN_WRITE=list can't keep apps in the App Library")
+                payload = state
+            else:
+                # Safety net: any installed app in neither the layout nor the library (an old
+                # backup, an app installed meanwhile) goes to the library, never onto a page.
+                library = list(library or [])
+                listed = {_leaf_id(x) for x in library if isinstance(x, dict)}
+                library += [x for x in library_from_installed(state, await self.installed_apps(provider))
+                            if x["bundleIdentifier"] not in listed]
+                payload = to_root_archive(state, library, pins)
+            await self._call(lambda sb: sb.set_icon_state(payload), provider)
 
     async def icon_png(self, bundle_id: str) -> bytes | None:
         return await self._call(lambda sb: sb.get_icon_pngdata(bundle_id))
